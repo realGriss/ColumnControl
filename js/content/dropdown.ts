@@ -6,6 +6,7 @@ import { IContentConfig, IContentPlugin } from './content';
 interface HTMLDropdown extends HTMLDivElement {
 	_shown: boolean;
 	_close: () => void;
+	_cleanup: () => void;
 }
 
 export interface IDropdownConfig extends IContentConfig {
@@ -47,23 +48,59 @@ interface IEventDropdownClose extends Event {
 	_closed: HTMLElement[];
 }
 
+// A document query cannot see dropdowns inside shadow roots (including closed roots).
+const shownDropdowns = new Set<HTMLDropdown>();
+
+function eventInside(el: Element, e: Event) {
+	return e.composedPath().includes(el) || el.contains(e.target as Node);
+}
+
 /**
  * Close all or only other dropdowns
  *
  * @param e Event or null to close all others
  */
 export function close(e: IEventDropdownClose | null = null) {
-	document.querySelectorAll<HTMLDropdown>('div.dtcc-dropdown').forEach((el) => {
-		if (e === null || !el.contains(e.target as Node)) {
+	shownDropdowns.forEach((el) => {
+		if (e === null || !eventInside(el, e)) {
 			el._close();
 
-			if (!e._closed) {
-				e._closed = [];
-			}
+			if (e) {
+				if (!e._closed) {
+					e._closed = [];
+				}
 
-			e._closed.push(el);
+				e._closed.push(el);
+			}
 		}
 	});
+}
+
+/**
+ * Listen inside the root as well as outside it. For closed shadow roots the body
+ * cannot see the original event path, so handle each event once, in its root first.
+ */
+function listen(dropdown: HTMLDropdown, type: string, handler: EventListener) {
+	let root = dropdown.getRootNode();
+	let body = dropdown.ownerDocument.body;
+	let seen = new WeakSet<Event>();
+	let listener = (e: Event) => {
+		if (!seen.has(e)) {
+			seen.add(e);
+			handler(e);
+		}
+	};
+
+	if (root !== dropdown.ownerDocument) {
+		root.addEventListener(type, listener);
+	}
+
+	body.addEventListener(type, listener);
+
+	return () => {
+		root.removeEventListener(type, listener);
+		body.removeEventListener(type, listener);
+	};
 }
 
 function getContainer(dt: Api, btn: HTMLButtonElement) {
@@ -126,43 +163,43 @@ function positionDropdown(dropdown: HTMLDropdown, dt: Api, btn: HTMLButtonElemen
  * @param btn Button the dropdown emanates from
  * @param autoFocus Selector to run to find if we can focus on an item
  *   automatically
- * @returns Function to call when the dropdown should be removed from the
- *   document
+ * @param focusHost Button to restore focus to when Escape is pressed
  */
-function attachDropdown(dropdown: HTMLDropdown, dt: Api, btn: Button, autoFocus: string) {
+function attachDropdown(dropdown: HTMLDropdown, dt: Api, btn: Button, autoFocus: string, focusHost: Button) {
+	dropdown._cleanup();
 	let dtContainer = getContainer(dt, btn.element());
 
 	dropdown._shown = true;
+	shownDropdowns.add(dropdown);
 	dtContainer.append(dropdown);
 	positionDropdown(dropdown, dt, btn.element());
 	btn.element().setAttribute('aria-expanded', 'true');
 
-	// Note that this could be called when the dropdown has already been removed from the document
-	// via another dropdown being shown. This will clean up the event on the next body click.
-	let removeDropdown = (e) => {
-		// Not in document, so just clean up the event handler
-		if (!dropdown._shown) {
-			document.body.removeEventListener('click', removeDropdown);
+	let removeDropdown = (e: Event) => {
+		if (eventInside(dropdown, e)) {
 			return;
 		}
 
-		// If the click is inside the dropdown, ignore it - we don't want to immediately close
-		if (e.target === dropdown || dropdown.contains(e.target)) {
-			return;
+		// DateTime can render its picker either in the root or in the document.
+		let root = dropdown.getRootNode() as Document | ShadowRoot;
+		let pickers = Array.from(root.querySelectorAll('div.dt-datetime'));
+		if (root !== dropdown.ownerDocument) {
+			pickers.push(...Array.from(dropdown.ownerDocument.querySelectorAll('div.dt-datetime')));
 		}
 
-		// If there is currently a datetime picker visible on the page, assume that it belongs to
-		// this dropdown. Don't want to close while operating on the picker.
-		let datetime = document.querySelector('div.dt-datetime');
-		if (datetime && (e.target === datetime || datetime.contains(e.target))) {
+		if (pickers.some((picker) => eventInside(picker, e))) {
 			return;
 		}
 
 		dropdown._close();
-		document.body.removeEventListener('click', removeDropdown);
 	};
 
-	document.body.addEventListener('click', removeDropdown);
+	let removeClick = listen(dropdown, 'click', removeDropdown);
+	let removeKeydown = listen(dropdown, 'keydown', focusCapture(dropdown, focusHost.element()));
+	dropdown._cleanup = () => {
+		removeClick();
+		removeKeydown();
+	};
 
 	// Focus on an input if we can
 	if (autoFocus) {
@@ -173,7 +210,6 @@ function attachDropdown(dropdown: HTMLDropdown, dt: Api, btn: Button, autoFocus:
 		}
 	}
 
-	return removeDropdown;
 }
 
 /**
@@ -184,27 +220,15 @@ function attachDropdown(dropdown: HTMLDropdown, dt: Api, btn: Button, autoFocus:
  * @param origin Target element
  */
 function relativePosition(parent: HTMLElement, origin: HTMLElement) {
-	let top = 0;
-	let left = 0;
-
-	while (origin && origin !== parent && origin !== document.body) {
-		top += origin.offsetTop;
-		left += origin.offsetLeft;
-
-		if (origin.scrollTop) {
-			left -= origin.scrollTop;
-		}
-
-		if (origin.scrollLeft) {
-			left -= origin.scrollLeft;
-		}
-
-		origin = origin.offsetParent as HTMLElement;
-	}
+	let parentRect = parent.getBoundingClientRect();
+	let originRect = origin.getBoundingClientRect();
+	// Convert viewport coordinates back to the container's CSS pixels when scaled.
+	let scaleX = parent.offsetWidth ? parentRect.width / parent.offsetWidth : 1;
+	let scaleY = parent.offsetHeight ? parentRect.height / parent.offsetHeight : 1;
 
 	return {
-		top,
-		left
+		top: (originRect.top - parentRect.top) / (scaleY || 1) - parent.clientTop + parent.scrollTop,
+		left: (originRect.left - parentRect.left) / (scaleX || 1) - parent.clientLeft + parent.scrollLeft
 	};
 }
 
@@ -225,7 +249,8 @@ function focusCapture(dropdown: HTMLDropdown, host: HTMLButtonElement) {
 		var elements: HTMLElement[] = Array.from(
 			dropdown.querySelectorAll('a, button, input, select')
 		);
-		var active = document.activeElement as HTMLElement;
+		var root = dropdown.getRootNode() as Document | ShadowRoot;
+		var active = root.activeElement as HTMLElement;
 
 		// An escape key should close the dropdown
 		if (e.key === 'Escape') {
@@ -283,7 +308,10 @@ const dropdownContent = {
 		]);
 
 		dropdown._shown = false;
+		dropdown._cleanup = () => {};
 		dropdown._close = () => {
+			dropdown._cleanup();
+			shownDropdowns.delete(dropdown);
 			dropdown.remove();
 			dropdown._shown = false;
 
@@ -300,7 +328,7 @@ const dropdownContent = {
 		// shown we just reattach the dropdown.
 		dt.on('fixedheader-mode', () => {
 			if (dropdown._shown) {
-				attachDropdown(dropdown, dt, config._parents ? config._parents[0] : btn, config.autoFocus);
+				attachDropdown(dropdown, dt, config._parents ? config._parents[0] : btn, config.autoFocus, btn);
 			}
 		});
 
@@ -319,7 +347,7 @@ const dropdownContent = {
 					return;
 				}
 
-				attachDropdown(dropdown, dt, config._parents ? config._parents[0] : btn, config.autoFocus);
+				attachDropdown(dropdown, dt, config._parents ? config._parents[0] : btn, config.autoFocus, btn);
 
 				// When activated using a key - auto focus on the first item in the popover
 				let focusable = dropdown.querySelector('input, a, button') as any;
@@ -359,12 +387,8 @@ const dropdownContent = {
 			positionDropdown(dropdown, dt, btn.element());
 		});
 
-		// Focus capture events
-		let capture = focusCapture(dropdown, btn.element());
-		document.body.addEventListener('keydown', capture);
-
 		dt.on('destroy', () => {
-			document.body.removeEventListener('keydown', capture);
+			dropdown._close();
 		});
 
 		return btn.element();
